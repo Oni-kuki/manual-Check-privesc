@@ -1,9 +1,8 @@
-# Récupère les SIDs de l'utilisateur courant + ses groupes
+# Récupère SIDs utilisateur + groupes
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $userSIDs = $user.Groups | ForEach-Object { $_.Value }
 $userSIDs += $user.User.Value
 
-# Liste des hives à auditer
 $hives = @(
     "HKLM:\SOFTWARE",
     "HKLM:\SYSTEM",
@@ -14,26 +13,48 @@ foreach ($hive in $hives) {
 
     Write-Host "`n--- Scanning $hive ---" -ForegroundColor Cyan
 
-    # Récupère récursivement toutes les clés accessibles (en silence si erro)
     Get-ChildItem $hive -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
 
         try {
             $acl = Get-Acl $_.PSPath
         } catch {
-            return
+            # On ignore simplement cette clé
+            continue
         }
 
-        # Permissions faibles si l'utilisateur ou ses groupes ont Write/Modify/FullControl
-        $weak = $acl.Access | Where-Object {
-            ($_.RegistryRights -match "Write|FullControl|SetValue|CreateSubKey") -and
-            ($userSIDs -contains $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value)
+        $weakACEs = @()
+
+        foreach ($ace in $acl.Access) {
+
+            # On essaie de récupérer le SID comme string, sans planter
+            try {
+                $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            } catch {
+                continue
+            }
+
+            # Vérifie si ACE applicable
+            if ($userSIDs -contains $sid) {
+
+                # Vérifie si droits dangereux
+                if ($ace.RegistryRights -band (
+                    [System.Security.AccessControl.RegistryRights]::FullControl +
+                    [System.Security.AccessControl.RegistryRights]::WriteKey +
+                    [System.Security.AccessControl.RegistryRights]::CreateSubKey +
+                    [System.Security.AccessControl.RegistryRights]::SetValue
+                )) {
+                    $weakACEs += $ace
+                }
+            }
         }
 
-        if ($weak) {
-            [PSCustomObject]@{
-                RegistryPath = $_.PSPath
-                Identity     = $weak.IdentityReference
-                Rights       = $weak.RegistryRights
+        if ($weakACEs.Count -gt 0) {
+            foreach ($ace in $weakACEs) {
+                [PSCustomObject]@{
+                    RegistryPath = $_.PSPath
+                    Identity     = $ace.IdentityReference.ToString()
+                    Rights       = $ace.RegistryRights.ToString()
+                }
             }
         }
     }
